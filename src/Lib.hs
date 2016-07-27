@@ -8,12 +8,13 @@ import           Control.Applicative
 import           Control.Monad
 import           Data.Aeson
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy as BL
 import           Data.Functor
 import           Data.Monoid
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import           Database.Redis
+import           Database.Redis as R
 
 -- | Trie configuration
 -- Initialize key prefix for creating trie in redis
@@ -30,11 +31,11 @@ suffixes = map (init . T.tails) . T.words . T.strip
 
 
 -- | Add search key, an unique identifier and value to trie set.
-addKeys :: (RedisCtx m f, ToJSON a, Applicative f) => (T.Text -> [[T.Text]]) -> RTrieConfig -> T.Text -> T.Text -> a -> m (f Integer)
-addKeys fixes cfg key id val =
+-- Add each sub key to a sorted set with value of the ID.
+addKeys :: (RedisCtx m f, Applicative f) => (T.Text -> [[T.Text]]) -> RTrieConfig -> T.Text -> T.Text -> m (f Integer)
+addKeys fixes cfg key id =
     let pps = fixes key
         bid = TE.encodeUtf8 id
-        mk = TE.encodeUtf8 $ metaKey cfg
         addtrie i p = do
           rs <- zadd (TE.encodeUtf8 $ indexKey cfg <> p) [(0.0, bid)]
           pure $ (+) <$> i <*> rs
@@ -42,33 +43,70 @@ addKeys fixes cfg key id val =
         addtriesS s ps = do
           rs <- addtries ps
           pure $ (+) <$> s <*> rs
-    in do
-      s <- foldM addtriesS (pure 0) pps
-      hset mk bid (BL.toStrict $ encode val)
-      return s
+    in foldM addtriesS (pure 0) pps
+
+
+
+
+addValue :: (ToJSON a, RedisCtx m f, Applicative f) => RTrieConfig -> T.Text -> a -> m (f Bool)
+addValue cfg id val = hset mk bid (BL.toStrict $ encode val)
+    where
+      mk = TE.encodeUtf8 $ metaKey cfg
+      bid = TE.encodeUtf8 id
+
+-- delKeys :: (RedisCtx m f, Applicative f) => (T.Text -> [[T.Text]]) 
 
 -- | Add all prefix keys for given key alongwith its id and value
 addPrefixKeys :: (RedisCtx m f, ToJSON a, Applicative f) => RTrieConfig -> T.Text -> T.Text -> a -> m (f Integer)
-addPrefixKeys = addKeys prefixes
+addPrefixKeys cfg key id val = do
+  num <- addKeys prefixes cfg key id
+  status <- addValue cfg id val
+  return $ num <* status
 
 
 -- | Add all suffix keys for given key alongwith its id and value
 addSuffixKeys :: (RedisCtx m f, ToJSON a, Applicative f) => RTrieConfig -> T.Text -> T.Text -> a -> m (f Integer)
-addSuffixKeys = addKeys suffixes
+addSuffixKeys cfg key id val = do
+  num <- addKeys suffixes cfg key id
+  status <- addValue cfg id val
+  return $ num <* status
 
 -- | Add all prefix and suffixes for the given key alongwith its id and values
 addPrefixSuffixKeys :: (RedisCtx m f, ToJSON a, Applicative f) => RTrieConfig -> T.Text -> T.Text -> a -> m (f Integer)
 addPrefixSuffixKeys cfg k id v = do
-    sp <- addPrefixKeys cfg k id v
-    ss <- addSuffixKeys cfg k id v
-    return $ (+) <$> sp <*> ss
+    sp <- addKeys prefixes cfg k id
+    ss <- addKeys suffixes cfg k id
+    status <- addValue cfg id v
+    return $ ( (+) <$> sp <*> ss ) <* status
 
--- | 
--- searchKeys :: (RedisCtx m f, FromJSON a, Applicative f) => RTrieConfig -> T.Text -> Integer -> Integer -> m (f [a])
-searchkeys cfg k index limit =
+getAllKeys :: RedisCtx m f => RTrieConfig -> m (f [B.ByteString])
+getAllKeys cfg = keys (TE.encodeUtf8 $ indexKey cfg <> "*")
+
+delAllKeys :: (Applicative f, RedisCtx m f) => [B.ByteString] -> m (f Integer)
+delAllKeys ks = del ks
+
+
+--delKeys :: Connection -> RTrieConfig -> IO Integer
+delKeys conn cfg = runRedis conn $ do
+                     keys <- getAllKeys cfg
+                     let allkeys = (mk :) <$> keys
+                     case allkeys of
+                       Right ks -> do
+                                    trs <- multiExec (delAllKeys ks)
+                                    case trs of
+                                      TxSuccess x -> return (Right x)
+                                      TxAborted   -> return $ Left (R.Error "Transaction aborted")
+                                      TxError s   -> return $ Left (R.Error $ B8.pack s)
+                       Left  rp -> return $ Left rp
+    where
+      mk = TE.encodeUtf8 $ metaKey cfg
+  
+
+--searchKeys :: (RedisCtx m f, FromJSON a, Applicative f) => RTrieConfig -> T.Text -> Integer -> Integer -> m (f [a])
+searchSubKeys cfg k index limit =
     let sk = TE.encodeUtf8 $ T.strip k
         mk = TE.encodeUtf8 $ metaKey cfg
-    in do
-      ss <- zrevrange sk index limit
-      hmget mk <$> ss
+    in zrevrange sk index limit
+
+getIDs 
   
